@@ -154,6 +154,17 @@ def test_inverse_vol_sizing():
     assert rm.position_notional(0.0) == 0.0                     # fail-closed
 
 
+def test_gross_exposure_cap():
+    cfg = RiskConfig(base_notional=1000.0, min_notional=50.0,
+                     max_gross_exposure_pct=50.0)
+    rm = RiskManager(cfg, 3_000)                    # cap = 1,500 gross
+    assert rm.position_notional(0.02, gross_exposure=0.0) == pytest.approx(1000.0)
+    # 1,200 already deployed → only 300 of headroom left.
+    assert rm.position_notional(0.02, gross_exposure=1_200.0) == pytest.approx(300.0)
+    # Headroom below min_notional → no trade at all.
+    assert rm.position_notional(0.02, gross_exposure=1_490.0) == 0.0
+
+
 # ------------------------------------------------------------- persistence
 def test_portfolio_checkpoint(tmp_path):
     path = str(tmp_path / "portfolio.ckpt")
@@ -178,6 +189,9 @@ class MockRouter(ExchangeRouter):
 
     async def connect(self):  pass
     async def close(self):  pass
+
+    async def get_tick_size(self, symbol):
+        return 0.01
 
     async def stream_market_data(self, symbol, book, on_update=None):
         # Session history: VWAP 100, σ 1. Then a −3σ flush with heavy
@@ -231,6 +245,54 @@ def test_engine_enters_on_dislocation(tmp_path):
     assert engine.unrealized_pnl() == pytest.approx(
         engine._signals["TEST-USD"].position
         * (engine.books["TEST-USD"].mid - engine._avg_entry["TEST-USD"]))
+
+
+def _run_engine_briefly(engine, seconds=1.0):
+    async def go():
+        task = asyncio.create_task(engine.run())
+        await asyncio.sleep(seconds)
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    asyncio.run(go())
+
+
+def test_fee_gate_vetoes_thin_edges(tmp_path):
+    """Same dislocation that normally enters must be refused when round-trip
+    fees exceed the expected mid→VWAP capture (~309bps in this fixture)."""
+    from meanrev.engine import Instrument, StrategyEngine
+
+    router = MockRouter()
+    risk = RiskManager(RiskConfig(fee_bps_per_side=200.0),  # 410bps required
+                       starting_equity=100_000)
+    engine = StrategyEngine([Instrument("TEST-USD", 0.01, router)],
+                            ckpt_dir=str(tmp_path), risk=risk)
+    engine._night.resolve = lambda *a, **k: mc.Regime.NORMAL
+    _run_engine_briefly(engine)
+    assert not router.orders, "fee gate should veto a sub-fee edge"
+    assert engine.signals["TEST-USD"].position == 0
+
+
+def test_deferred_tick_resolution_applies_overrides(tmp_path):
+    """Instruments with tick_size=None must be built inside run() from the
+    venue's tick size, with signal_overrides applied at build time."""
+    from meanrev.engine import Instrument, StrategyEngine
+
+    router = MockRouter()
+    risk = RiskManager(RiskConfig(), starting_equity=100_000)
+    engine = StrategyEngine(
+        [Instrument("TEST-USD", None, router)],
+        ckpt_dir=str(tmp_path), risk=risk,
+        signal_overrides={"entry_z": 2.0, "obi_min": 0.10})
+    assert "TEST-USD" not in engine.books      # not built yet
+    engine._night.resolve = lambda *a, **k: mc.Regime.NORMAL
+    _run_engine_briefly(engine)
+    assert engine.books["TEST-USD"].tick_size == pytest.approx(0.01)
+    assert engine.signals["TEST-USD"].config.entry_z == pytest.approx(2.0)
+    # The −3σ fixture entered, proving the deferred instrument trades.
+    assert any(o.side.value == "buy" for o in router.orders)
 
 
 def test_entry_skips_one_sided_book(tmp_path):

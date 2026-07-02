@@ -45,19 +45,35 @@ DEEP_BID_REPRICE_SIGMA = 0.1  # ...unless fair value moved this many σ
 @dataclass
 class Instrument:
     symbol: str
-    tick_size: float
+    tick_size: float | None   # None → resolved from the venue at startup
     router: ExchangeRouter
 
 
 class StrategyEngine:
     def __init__(self, instruments: list[Instrument], risk: RiskManager,
-                 ckpt_dir: str = "./state"):
+                 ckpt_dir: str = "./state",
+                 enable_night_quoting: bool = False,
+                 signal_overrides: dict | None = None):
         import microcore
 
         self._mc = microcore
         self._risk = risk
         self._night = NightMarketRegime()
         self._instruments = instruments
+        self._ckpt_dir = ckpt_dir
+        # SignalConfig field overrides (e.g. {"entry_z": 2.0}) applied to
+        # every instrument AT BUILD TIME. This is the supported way to
+        # retune the strategy: instruments with tick_size=None are built
+        # inside run(), after user code has already executed, so mutating
+        # engine.configs from the outside would silently miss them.
+        self._signal_overrides = dict(signal_overrides or {})
+        # Night deep-bid quoting is OFF unless explicitly enabled: a filled
+        # passive bid is only visible through the authenticated fills
+        # stream, which isn't wired yet — an untracked overnight fill is an
+        # unacceptable failure mode with real capital. Everything else about
+        # the night regime (cancel aggressive orders, exit-only DEX) is
+        # unaffected.
+        self._enable_night_quoting = enable_night_quoting
         self._books: dict[str, "microcore.OrderBook"] = {}
         self._signals: dict[str, "microcore.SignalGenerator"] = {}
         self._configs: dict[str, "microcore.SignalConfig"] = {}
@@ -73,26 +89,37 @@ class StrategyEngine:
 
         os.makedirs(ckpt_dir, exist_ok=True)
         for ins in instruments:
-            cfg = microcore.SignalConfig()
-            book = microcore.OrderBook(ins.tick_size, 20)
-            sig = microcore.SignalGenerator(cfg)
-            ckpt = microcore.Checkpointer(
-                os.path.join(ckpt_dir, f"{ins.symbol.replace('/', '_')}.ckpt"))
-            # Crash recovery: restore book/VWAP/position/regime if a valid
-            # snapshot exists; otherwise start cold and let the feed's
-            # snapshot rebuild the book.
-            if ckpt.load(book, sig):
-                log.info("%s: recovered checkpoint (seq=%d, pos=%.6f)",
-                         ins.symbol, book.seq, sig.position)
-            self._books[ins.symbol] = book
-            self._signals[ins.symbol] = sig
-            # Store the generator's LIVE config (a reference to its internal
-            # cfg_), not the throwaway `cfg` we constructed it with — that
-            # one is a disconnected copy. Retuning engine.configs[...] now
-            # writes straight through to what evaluate() reads.
-            self._configs[ins.symbol] = sig.config
-            self._ckpts[ins.symbol] = ckpt
-            self._md_events[ins.symbol] = asyncio.Event()
+            if ins.tick_size is not None:
+                self._init_instrument(ins, ins.tick_size)
+            # tick_size None: built in run() once the venue tells us the
+            # real quote increment — guessing (e.g. 0.01 for DOGE at $0.18)
+            # quantizes the whole book onto wrong prices.
+
+    def _init_instrument(self, ins: Instrument, tick_size: float) -> None:
+        microcore = self._mc
+        book = microcore.OrderBook(tick_size, 20)
+        sig = microcore.SignalGenerator(microcore.SignalConfig())
+        for field, value in self._signal_overrides.items():
+            if not hasattr(sig.config, field):
+                raise AttributeError(f"unknown SignalConfig field: {field}")
+            setattr(sig.config, field, value)
+        ckpt = microcore.Checkpointer(
+            os.path.join(self._ckpt_dir,
+                         f"{ins.symbol.replace('/', '_')}.ckpt"))
+        # Crash recovery: restore book/VWAP/position/regime if a valid
+        # snapshot exists; otherwise start cold and let the feed's
+        # snapshot rebuild the book.
+        if ckpt.load(book, sig):
+            log.info("%s: recovered checkpoint (seq=%d, pos=%.6f)",
+                     ins.symbol, book.seq, sig.position)
+        self._books[ins.symbol] = book
+        self._signals[ins.symbol] = sig
+        # Store the generator's LIVE config (a reference to its internal
+        # cfg_), not a disconnected copy — retuning engine.configs[...]
+        # writes straight through to what evaluate() reads.
+        self._configs[ins.symbol] = sig.config
+        self._ckpts[ins.symbol] = ckpt
+        self._md_events[ins.symbol] = asyncio.Event()
 
     # ---- read-only surface for the dashboard -------------------------------
     @property
@@ -132,6 +159,18 @@ class StrategyEngine:
     def total_pnl(self) -> float:
         return self._realized_pnl + self.unrealized_pnl()
 
+    def gross_exposure(self) -> float:
+        """Total open notional across all instruments (marked at mid,
+        falling back to entry price when the book is momentarily empty)."""
+        gross = 0.0
+        for sym, sig in self._signals.items():
+            pos = sig.position
+            if pos > 0:
+                mid = self._books[sym].mid
+                px = mid if mid > 0 else self._avg_entry.get(sym, 0.0)
+                gross += pos * px
+        return gross
+
     # ------------------------------------------------------------------ run
     async def run(self) -> None:
         # GC tuning: after startup, everything long-lived (books, routers,
@@ -146,6 +185,16 @@ class StrategyEngine:
         routers = {ins.router for ins in self._instruments}
         for r in routers:
             await r.connect()
+        # Resolve venue-authoritative tick sizes for instruments that were
+        # constructed with tick_size=None (needs a live session, hence here
+        # and not in __init__).
+        for ins in self._instruments:
+            if ins.symbol not in self._books:
+                tick = await ins.router.get_tick_size(ins.symbol)
+                ins.tick_size = tick
+                self._init_instrument(ins, tick)
+                log.info("%s: tick size %s (venue-resolved)",
+                         ins.symbol, tick)
         tasks = []
         for ins in self._instruments:
             event = self._md_events[ins.symbol]
@@ -236,10 +285,23 @@ class StrategyEngine:
                 px = book.best_ask
                 if px <= 0 or s.mid <= 0:
                     continue
+                # Fee-awareness gate: the trade's expected gross capture is
+                # the reversion distance mid → VWAP (the exit target). If
+                # that can't clear the round-trip fees plus a minimum profit,
+                # the entry is a statistically guaranteed bleed no matter how
+                # stretched the z-score is — refuse it. This is what makes a
+                # small account survive Coinbase's retail fee tier.
+                edge_bps = (book.vwap - s.mid) / s.mid * 1e4
+                if edge_bps < self._risk.cfg.min_edge_bps:
+                    log.debug("%s entry vetoed: edge %.0fbps < %.0fbps fees",
+                              ins.symbol, edge_bps, self._risk.cfg.min_edge_bps)
+                    continue
                 # σ_vwap / vwap as the instrument's dimensionless vol proxy
-                # for inverse-vol sizing.
+                # for inverse-vol sizing; sized inside portfolio-level
+                # gross-exposure headroom.
                 vol_proxy = book.sigma / book.vwap if book.vwap > 0 else 0.0
-                notional = self._risk.position_notional(vol_proxy)
+                notional = self._risk.position_notional(
+                    vol_proxy, gross_exposure=self.gross_exposure())
                 if notional <= 0:
                     continue
                 qty = notional / s.mid
@@ -285,6 +347,10 @@ class StrategyEngine:
 
             elif s.action == Action.PLACE_DEEP_BID:
                 # Night CEX posture: keep exactly one deep resting bid.
+                # Gated: without the authenticated fills stream, a passive
+                # bid that fills overnight becomes an untracked position.
+                if not self._enable_night_quoting:
+                    continue
                 # Throttled cancel-replace — re-quote only when the quote is
                 # stale or fair value has moved materially; without this the
                 # loop would churn cancel/replace on every book tick, which
@@ -300,7 +366,8 @@ class StrategyEngine:
                             and moved < DEEP_BID_REPRICE_SIGMA * book.sigma):
                         continue
                 vol_proxy = book.sigma / book.vwap if book.vwap > 0 else 0.0
-                notional = self._risk.position_notional(vol_proxy)
+                notional = self._risk.position_notional(
+                    vol_proxy, gross_exposure=self.gross_exposure())
                 if notional <= 0:
                     continue
                 await ins.router.cancel_all(ins.symbol)

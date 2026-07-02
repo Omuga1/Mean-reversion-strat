@@ -111,6 +111,19 @@ class CoinbaseCEX(ExchangeRouter):
             await self._session.close()
 
     # ------------------------------------------------------------ market data
+    async def get_tick_size(self, symbol: str) -> float:
+        """quote_increment from the public product endpoint (no auth)."""
+        path = f"/api/v3/brokerage/market/products/{symbol}"
+
+        async def _do():
+            async with self._session.get(REST_BASE + path) as resp:
+                data = await resp.json()
+                if resp.status != 200 or "quote_increment" not in data:
+                    raise ConnectionError(f"product lookup failed: {data}")
+                return float(data["quote_increment"])
+
+        return await self._retry(_do)
+
     async def stream_market_data(self, symbol: str, book,
                                  on_update=None) -> None:
         """level2 + market_trades channels → C++ book. Reconnect forever."""

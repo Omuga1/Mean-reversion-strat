@@ -104,6 +104,11 @@ class TerminalDashboard:
             f"{'Z':>7} {'OBI':>7} {'SPRbps':>7} {'MSG/s':>6} "
             f"{'POS':>12} {'REGIME':<20} ENTRY{RESET}")
         for ins in self._e.instruments:
+            if ins.symbol not in self._e.books:
+                # tick size still being resolved from the venue at startup
+                lines.append(f"{BOLD}{ins.symbol:<10}{RESET} "
+                             f"{DIM}connecting…{RESET}")
+                continue
             lines.append(self._instrument_row(ins.symbol))
         lines.append("")
         lines.append(f"{BOLD}EVENTS{RESET}")

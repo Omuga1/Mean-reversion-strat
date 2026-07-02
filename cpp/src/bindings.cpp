@@ -108,6 +108,7 @@ PYBIND11_MODULE(microcore, m) {
         .def_property_readonly("sigma", &OrderBook::sigma)
         .def_property_readonly("vwap_zscore", &OrderBook::vwap_zscore)
         .def("vwap_band", &OrderBook::vwap_band, py::arg("k"))
+        .def_property_readonly("tick_size", &OrderBook::tick_size)
         .def_property_readonly("seq", &OrderBook::seq);
 
     py::class_<SignalGenerator>(m, "SignalGenerator")

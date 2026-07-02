@@ -122,6 +122,16 @@ class ExchangeRouter(abc.ABC):
         strictly worse than a briefly empty one.
         """
 
+    # ---- instrument metadata ----------------------------------------------
+    async def get_tick_size(self, symbol: str) -> float:
+        """Venue-authoritative price increment for `symbol`. Engines call
+        this for instruments constructed with tick_size=None so book
+        quantization always matches the venue — a hardcoded 0.01 tick
+        silently corrupts the book for sub-dollar instruments (every DOGE
+        price collapses onto 2 decimals)."""
+        raise NotImplementedError(f"{self.name} cannot resolve tick sizes; "
+                                  "pass tick_size explicitly")
+
     # ---- order entry -----------------------------------------------------
     @abc.abstractmethod
     async def submit_order(self, req: OrderRequest) -> OrderResult: ...

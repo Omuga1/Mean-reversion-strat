@@ -52,6 +52,22 @@ class RiskConfig:
     sigma_target_daily: float = 0.02    # 2% target daily vol per position
     base_notional: float = 1_000.0      # position size at σ == σ_target
     min_notional: float = 50.0          # below this, don't bother trading
+    # Gross exposure cap: total open notional may never exceed this share
+    # of equity. Prevents N independent per-symbol entries from quietly
+    # deploying N × base_notional on a correlated market-wide dip.
+    max_gross_exposure_pct: float = 50.0
+    # Execution economics. A mean-reversion round trip pays fees twice; an
+    # entry whose expected capture (mid → VWAP) can't clear
+    # 2·fee_bps_per_side + min_profit_bps is a guaranteed bleed and is
+    # refused regardless of how pretty the z-score looks. Coinbase retail
+    # tiers pay roughly 25-120 bps/side depending on 30-day volume — set
+    # this to YOUR tier; the default is deliberately conservative.
+    fee_bps_per_side: float = 60.0
+    min_profit_bps: float = 10.0
+
+    @property
+    def min_edge_bps(self) -> float:
+        return 2.0 * self.fee_bps_per_side + self.min_profit_bps
 
 
 class RiskManager:
@@ -135,16 +151,24 @@ class RiskManager:
             return 0.0
         return 100.0 * (self._hwm - self._equity) / self._hwm
 
-    def position_notional(self, realized_vol_daily: float) -> float:
+    def position_notional(self, realized_vol_daily: float,
+                          gross_exposure: float = 0.0) -> float:
         """Inverse-volatility sizing (see module docstring). `realized_vol
         _daily` should be the instrument's own realized daily vol, e.g.
-        σ_vwap annualization-free proxy from the C++ tracker."""
+        σ_vwap annualization-free proxy from the C++ tracker.
+        `gross_exposure` is the portfolio's current total open notional;
+        the returned size is clipped so gross never exceeds
+        max_gross_exposure_pct of equity."""
         if self.halted:
             return 0.0
         if realized_vol_daily <= 0:
             return 0.0  # no vol estimate → no trade (fail-closed)
         scale = min(1.0, self.cfg.sigma_target_daily / realized_vol_daily)
         notional = self.cfg.base_notional * scale
+        # Portfolio-level cap: headroom left under the gross exposure limit.
+        headroom = (self.cfg.max_gross_exposure_pct / 100.0) * self._equity \
+            - gross_exposure
+        notional = min(notional, max(headroom, 0.0))
         return notional if notional >= self.cfg.min_notional else 0.0
 
     @staticmethod
