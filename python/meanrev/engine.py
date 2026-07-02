@@ -227,13 +227,21 @@ class StrategyEngine:
                 await ins.router.cancel_all(ins.symbol)
 
             elif s.action == Action.ENTER_LONG:
+                # A z-score can be valid (it's built from the trade tape)
+                # while the L2 book is momentarily one-sided or empty — right
+                # after a resync/clear, or before the first snapshot repopu-
+                # lates it. Without a real ask to cross and a real mid to
+                # size against, there is nothing to buy: skip rather than
+                # divide by zero or post a limit at price 0.
+                px = book.best_ask
+                if px <= 0 or s.mid <= 0:
+                    continue
                 # σ_vwap / vwap as the instrument's dimensionless vol proxy
                 # for inverse-vol sizing.
                 vol_proxy = book.sigma / book.vwap if book.vwap > 0 else 0.0
                 notional = self._risk.position_notional(vol_proxy)
                 if notional <= 0:
                     continue
-                px = book.best_ask
                 qty = notional / s.mid
                 res = await ins.router.submit_order(OrderRequest(
                     symbol=ins.symbol, side=OrderSide.BUY,
@@ -256,6 +264,10 @@ class StrategyEngine:
                 if qty <= 0:
                     continue
                 px = book.best_bid
+                if px <= 0:
+                    # No bid to hit right now; leave the position and retry
+                    # on the next tick rather than sell into a price-0 limit.
+                    continue
                 res = await ins.router.submit_order(OrderRequest(
                     symbol=ins.symbol, side=OrderSide.SELL,
                     order_type=OrderType.LIMIT, qty=qty,

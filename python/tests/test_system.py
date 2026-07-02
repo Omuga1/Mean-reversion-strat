@@ -233,6 +233,41 @@ def test_engine_enters_on_dislocation(tmp_path):
         * (engine.books["TEST-USD"].mid - engine._avg_entry["TEST-USD"]))
 
 
+def test_entry_skips_one_sided_book(tmp_path):
+    """A valid z-score with an empty ask side must not crash (div-by-zero)
+    or post a price-0 limit — the engine skips until there's a real ask."""
+    from meanrev.engine import Instrument, StrategyEngine
+
+    class OneSidedRouter(MockRouter):
+        async def stream_market_data(self, symbol, book, on_update=None):
+            # Trades build VWAP stats (z valid), bids present (OBI = +1),
+            # but NO asks: best_ask == 0, mid falls back to last_trade.
+            for _ in range(100):
+                book.on_trades_batch([99.0, 101.0], [1.0, 1.0])
+            book.apply_deltas_batch([0], [96.99], [10.0])  # bid only
+            if on_update is not None:
+                on_update()
+            await asyncio.sleep(3600)
+
+    router = OneSidedRouter()
+    risk = RiskManager(RiskConfig(), starting_equity=100_000)
+    engine = StrategyEngine([Instrument("X-USD", 0.01, router)],
+                            ckpt_dir=str(tmp_path), risk=risk)
+    engine._night.resolve = lambda *a, **k: mc.Regime.NORMAL
+
+    async def run_briefly():
+        task = asyncio.create_task(engine.run())
+        await asyncio.sleep(0.6)
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    asyncio.run(run_briefly())  # must not raise ZeroDivisionError
+    assert not router.orders, "must not order into a one-sided book"
+
+
 def test_dashboard_renders(tmp_path):
     """The TUI must render against a live engine object without touching
     the terminal (pure string assembly)."""
