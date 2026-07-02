@@ -48,12 +48,33 @@ class CoinbaseCEX(ExchangeRouter):
         self._open_orders: dict[str, set[str]] = {}   # symbol -> order_ids
 
     # ------------------------------------------------------------------ auth
+    def _signing_key(self):
+        """CDP issues API keys in two formats depending on when/how they
+        were created: legacy EC keys as a PEM string (signed with ES256),
+        or the current default — an Ed25519 key as a raw base64 string
+        (signed with EdDSA). Detect by shape rather than requiring the
+        caller to know which vintage of key they have.
+        """
+        raw = self._key_pem.strip()
+        if raw.startswith("-----BEGIN"):
+            return raw, "ES256"
+
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey)
+
+        key_bytes = base64.b64decode(raw)
+        # CDP's Ed25519 secret is the 32-byte seed, optionally followed by
+        # the 32-byte public key (64 bytes total); only the seed is needed.
+        seed = key_bytes[:32]
+        return Ed25519PrivateKey.from_private_bytes(seed), "EdDSA"
+
     def _jwt(self, method: str, path: str) -> str:
-        """Coinbase CDP auth: short-lived ES256 JWT bound to method+path.
+        """Coinbase CDP auth: short-lived JWT bound to method+path.
 
         The `uri` claim pins the token to a single endpoint and the 2-minute
-        expiry bounds replay. Built per-request; ES256 signing is ~50 µs,
-        irrelevant next to the network RTT.
+        expiry bounds replay. Built per-request; signing is tens of
+        microseconds, irrelevant next to the network RTT.
         """
         import jwt  # PyJWT with cryptography backend
 
@@ -65,8 +86,9 @@ class CoinbaseCEX(ExchangeRouter):
             "exp": now + 120,
             "uri": f"{method} {REST_BASE.removeprefix('https://')}{path}",
         }
+        key, alg = self._signing_key()
         return jwt.encode(
-            payload, self._key_pem, algorithm="ES256",
+            payload, key, algorithm=alg,
             headers={"kid": self._key_name, "nonce": secrets.token_hex(16)},
         )
 
