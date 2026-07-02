@@ -1,0 +1,15 @@
+# build artifacts
+build/
+*.o
+*.so
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# runtime state (mmap checkpoints) & secrets
+state/
+*.ckpt
+*.pem
+keypair*.json
+.env
