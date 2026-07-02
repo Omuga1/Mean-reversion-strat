@@ -110,7 +110,13 @@ class CoinbaseCEX(ExchangeRouter):
 
         while True:
             try:
-                async with websockets.connect(WS_URL, max_queue=None) as ws:
+                # max_size: the library default (1 MiB) is smaller than a
+                # full BTC-USD level2 snapshot, which makes the client abort
+                # with 1009 "message too big" on every connect. 32 MiB is
+                # ample for any snapshot while still bounding memory.
+                async with websockets.connect(
+                        WS_URL, max_size=32 * 1024 * 1024,
+                        max_queue=None) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe", "product_ids": [symbol],
                         "channel": "level2",
