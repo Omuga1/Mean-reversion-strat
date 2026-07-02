@@ -129,7 +129,37 @@ encoded on-chain (`min_out`), so a breached guard reverts atomically — no
 fill instead of a bad fill — and the order is never exposed to the public
 mempool where it could be sandwiched.
 
-## 8. Building & testing
+## 8. Terminal dashboard & running
+
+`python/trade_example.py` is the runnable entry point: multi-symbol Coinbase
+trading with a zero-dependency ANSI dashboard (`meanrev/ui.py`) that redraws
+in place — risk strip (equity, P&L, drawdown vs breaker, dead-zone
+countdown), one row per instrument (mid, VWAP, σ, z, OBI, spread, feed
+msg/s, position, regime), an **entry-proximity meter** showing how far price
+has travelled toward the −entry_z trigger and whether OBI confirms, and the
+recent event log. Logging goes to `meanrev.log`; stdout belongs to the
+renderer.
+
+**"It hasn't traded" is usually correct behavior.** An entry needs a −2.5σ
+dislocation *and* OBI ≥ +0.15 simultaneously — an anomaly hunter fires a few
+times a week per major pair, not per hour. The proximity meter exists so you
+can see it stalking setups instead of wondering if it's dead.
+
+### Performance notes
+
+- The signal loop is **event-driven**: feed adapters fire a per-symbol
+  `asyncio.Event` after each applied frame, so evaluation happens one event-
+  loop hop after the book updates (a 250 ms heartbeat remains only as a
+  regime-flush fallback).
+- Optional accelerators (`pip install uvloop orjson`): libuv event loop and
+  ~5-10× faster websocket frame decode. Auto-detected, never required.
+- GC is tuned at engine start (`gc.freeze()` + raised thresholds) to keep
+  multi-ms collector pauses off the tick-to-decision path.
+- **WSL users**: run from the Linux filesystem (`~/...`), not `/mnt/c/...`.
+  The 9p bridge to the Windows drive adds milliseconds to every file
+  operation — checkpoint writes and module loads included.
+
+## 9. Building & testing
 
 ```bash
 # C++ core tests (no Python needed)
@@ -145,7 +175,7 @@ g++ -std=c++17 -O3 -march=native -shared -fPIC \
 cd python && python3 -m pytest tests/ -q
 ```
 
-## 9. Layout
+## 10. Layout
 
 ```
 cpp/include/order_book.hpp       L2 book, OBI, VWAP σ-bands (header-only core)

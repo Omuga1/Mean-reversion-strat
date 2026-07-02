@@ -85,7 +85,8 @@ class PumpFunDEX(ExchangeRouter):
             await self._session.close()
 
     # ---------------------------------------------------------- market data
-    async def stream_market_data(self, mint: str, book) -> None:
+    async def stream_market_data(self, mint: str, book,
+                                 on_update=None) -> None:
         """accountSubscribe on the bonding-curve PDA + logsSubscribe for
         taker prints. Every curve update re-synthesizes the pseudo-book."""
         import websockets
@@ -111,12 +112,16 @@ class PumpFunDEX(ExchangeRouter):
                             state = self._decode_curve(msg)
                             if state:
                                 self._rebuild_synthetic_book(mint, book, *state)
+                                if on_update is not None:
+                                    on_update()
                         elif method == "logsNotification":
                             trade = self._decode_trade(msg)
                             if trade:
                                 price, qty, is_buy = trade
                                 book.on_trade(price, qty)
                                 self._bump_flow(mint, qty if is_buy else -qty)
+                                if on_update is not None:
+                                    on_update()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — feed must self-heal

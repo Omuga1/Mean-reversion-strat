@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pybind11>=2.12"]
+# Optional hot-path accelerators: uvloop (libuv event loop) and orjson
+# (fast websocket frame decode). The system runs without them.
+perf = ["uvloop>=0.19", "orjson>=3.9"]
 
 [tool.setuptools.packages.find]
 include = ["meanrev*"]

@@ -108,8 +108,14 @@ class ExchangeRouter(abc.ABC):
 
     # ---- market data -----------------------------------------------------
     @abc.abstractmethod
-    async def stream_market_data(self, symbol: str, book) -> None:
+    async def stream_market_data(self, symbol: str, book,
+                                 on_update=None) -> None:
         """Run forever: pump venue L2/trade events into a microcore.OrderBook.
+
+        `on_update` (a zero-arg callable, typically asyncio.Event.set) MUST
+        be invoked after each applied frame — it is what makes the signal
+        loop event-driven instead of polled, so forgetting it silently adds
+        up to SIGNAL_FALLBACK_S of decision latency.
 
         Must detect sequence gaps and resync (clear + snapshot) rather than
         apply deltas onto a desynchronized book — a silently wrong book is

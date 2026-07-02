@@ -57,6 +57,7 @@ class RiskConfig:
 class RiskManager:
     def __init__(self, cfg: RiskConfig, starting_equity: float):
         self.cfg = cfg
+        self.starting_equity = starting_equity
         self._equity = starting_equity
         self._hwm = starting_equity
         self._hwm_day = self._utc_day()
@@ -118,6 +119,21 @@ class RiskManager:
     def halted(self) -> bool:
         """Consumed by NightMarketRegime.resolve() every engine loop."""
         return self._breaker_latched or self._breakdown()
+
+    # ---- read-only surface for the dashboard ----------------------------
+    @property
+    def equity(self) -> float:
+        return self._equity
+
+    @property
+    def breaker_latched(self) -> bool:
+        return self._breaker_latched
+
+    @property
+    def drawdown_pct(self) -> float:
+        if self._hwm <= 0:
+            return 0.0
+        return 100.0 * (self._hwm - self._equity) / self._hwm
 
     def position_notional(self, realized_vol_daily: float) -> float:
         """Inverse-volatility sizing (see module docstring). `realized_vol

@@ -27,6 +27,13 @@ import secrets
 import time
 from typing import AsyncIterator, Optional
 
+try:
+    # orjson decodes Coinbase's L2 frames ~5-10x faster than stdlib json —
+    # message decode is the largest Python-side cost on the feed path.
+    from orjson import loads as json_loads
+except ImportError:                              # pragma: no cover
+    from json import loads as json_loads
+
 from ..router import (ExchangeRouter, Fill, OrderRequest, OrderResult,
                       OrderSide, OrderType, VenueKind)
 
@@ -104,7 +111,8 @@ class CoinbaseCEX(ExchangeRouter):
             await self._session.close()
 
     # ------------------------------------------------------------ market data
-    async def stream_market_data(self, symbol: str, book) -> None:
+    async def stream_market_data(self, symbol: str, book,
+                                 on_update=None) -> None:
         """level2 + market_trades channels → C++ book. Reconnect forever."""
         import websockets
 
@@ -125,9 +133,11 @@ class CoinbaseCEX(ExchangeRouter):
                         "type": "subscribe", "product_ids": [symbol],
                         "channel": "market_trades",
                     }))
+                    log.info("coinbase %s: subscribed (level2 + trades)",
+                             symbol)
                     last_seq: Optional[int] = None
                     async for raw in ws:
-                        msg = json.loads(raw)
+                        msg = json_loads(raw)
                         seq = msg.get("sequence_num")
                         if last_seq is not None and seq not in (None, last_seq + 1):
                             # Sequence gap: the local book is now fiction.
@@ -139,6 +149,8 @@ class CoinbaseCEX(ExchangeRouter):
                             break
                         last_seq = seq
                         self._dispatch(msg, book)
+                        if on_update is not None:
+                            on_update()  # wake the signal loop: fresh state
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — feed must self-heal

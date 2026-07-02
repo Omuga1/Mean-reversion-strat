@@ -150,12 +150,14 @@ class MockRouter(ExchangeRouter):
     async def connect(self):  pass
     async def close(self):  pass
 
-    async def stream_market_data(self, symbol, book):
+    async def stream_market_data(self, symbol, book, on_update=None):
         # Session history: VWAP 100, σ 1. Then a −3σ flush with heavy
         # passive bids underneath — the canonical mean-reversion entry.
         for _ in range(100):
             book.on_trades_batch([99.0, 101.0], [1.0, 1.0])
         book.apply_deltas_batch([0, 1], [96.99, 97.01], [10.0, 1.0])
+        if on_update is not None:
+            on_update()
         await asyncio.sleep(3600)
 
     async def submit_order(self, req: OrderRequest) -> OrderResult:
@@ -196,3 +198,28 @@ def test_engine_enters_on_dislocation(tmp_path):
         "engine should have entered long on a −3σ dislocation with OBI support"
     # Position accounting flowed back into the C++ signal state.
     assert engine._signals["TEST-USD"].position > 0
+    # ...and P&L marks against the recorded entry price.
+    assert engine.unrealized_pnl() == pytest.approx(
+        engine._signals["TEST-USD"].position
+        * (engine.books["TEST-USD"].mid - engine._avg_entry["TEST-USD"]))
+
+
+def test_dashboard_renders(tmp_path):
+    """The TUI must render against a live engine object without touching
+    the terminal (pure string assembly)."""
+    from meanrev.engine import Instrument, StrategyEngine
+    from meanrev.ui import TerminalDashboard
+
+    router = MockRouter()
+    risk = RiskManager(RiskConfig(), starting_equity=100_000)
+    engine = StrategyEngine([Instrument("TEST-USD", 0.01, router)],
+                            ckpt_dir=str(tmp_path), risk=risk)
+    book = engine.books["TEST-USD"]
+    for _ in range(10):
+        book.on_trades_batch([99.0, 101.0], [1.0, 1.0])
+    book.apply_deltas_batch([0, 1], [99.99, 100.01], [2.0, 1.0])
+
+    frame = TerminalDashboard(engine)._render()
+    assert "TEST-USD" in frame
+    assert "100,000.00" in frame       # equity strip
+    assert "NORMAL" in frame           # regime column

@@ -4,12 +4,17 @@ Data path (hot, C++):
     venue ws frame ──batch──▶ OrderBook.apply_deltas_batch (GIL released)
                               └▶ OBI / VWAP σ / z updated in place
 
-Decision path (per book update or 5m close, C++ pure function):
-    SignalGenerator.evaluate(book) ──▶ Signal{action, limit_price, z, obi}
+Decision path (event-driven, C++ pure function):
+    feed adapter fires a per-symbol asyncio.Event after every applied frame;
+    the signal loop wakes on it and calls SignalGenerator.evaluate(book).
+    Decision latency is therefore one event-loop hop after the frame lands
+    in the book (~tens of µs) instead of a polling interval.
 
 Control path (slow, Python, ~1 Hz):
     RiskManager.halted ┐
     NightMarketRegime  ┴──▶ SignalGenerator.set_regime(...)   (C++ gate)
+    plus mark-to-market equity into the drawdown breaker and 5-minute
+    BTC/SOL leader samples into the correlation filter.
 
 Execution path (asyncio, ms-scale):
     Signal.action ──▶ ExchangeRouter.submit_order / cancel_all
@@ -17,7 +22,9 @@ Execution path (asyncio, ms-scale):
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -29,7 +36,10 @@ log = logging.getLogger(__name__)
 
 CHECKPOINT_EVERY_S = 5.0     # mmap snapshot cadence (≈128 KiB memcpy)
 CONTROL_LOOP_S = 1.0         # regime/risk refresh cadence
-SIGNAL_LOOP_S = 0.25         # decision cadence (book updates continuously)
+SIGNAL_FALLBACK_S = 0.25     # signal-loop wake even if the feed goes quiet
+LEADER_SAMPLE_S = 300.0      # 5-minute closes for the correlation filter
+DEEP_BID_REFRESH_S = 30.0    # min age before re-quoting the night deep bid
+DEEP_BID_REPRICE_SIGMA = 0.1  # ...unless fair value moved this many σ
 
 
 @dataclass
@@ -50,14 +60,22 @@ class StrategyEngine:
         self._instruments = instruments
         self._books: dict[str, "microcore.OrderBook"] = {}
         self._signals: dict[str, "microcore.SignalGenerator"] = {}
+        self._configs: dict[str, "microcore.SignalConfig"] = {}
         self._ckpts: dict[str, "microcore.Checkpointer"] = {}
+        self._md_events: dict[str, asyncio.Event] = {}
         self._trail_stops: dict[str, float] = {}
+        self._deep_bids: dict[str, tuple[float, float]] = {}  # sym -> (px, ts)
+        # P&L accounting (approximate until the fills stream is wired: entry
+        # marked at the submitted limit, exits at the touch we crossed).
+        self._avg_entry: dict[str, float] = {}
+        self._realized_pnl = 0.0
+        self.start_ts = time.time()
 
-        import os
         os.makedirs(ckpt_dir, exist_ok=True)
         for ins in instruments:
+            cfg = microcore.SignalConfig()
             book = microcore.OrderBook(ins.tick_size, 20)
-            sig = microcore.SignalGenerator(microcore.SignalConfig())
+            sig = microcore.SignalGenerator(cfg)
             ckpt = microcore.Checkpointer(
                 os.path.join(ckpt_dir, f"{ins.symbol.replace('/', '_')}.ckpt"))
             # Crash recovery: restore book/VWAP/position/regime if a valid
@@ -68,17 +86,69 @@ class StrategyEngine:
                          ins.symbol, book.seq, sig.position)
             self._books[ins.symbol] = book
             self._signals[ins.symbol] = sig
+            self._configs[ins.symbol] = cfg
             self._ckpts[ins.symbol] = ckpt
+            self._md_events[ins.symbol] = asyncio.Event()
+
+    # ---- read-only surface for the dashboard -------------------------------
+    @property
+    def instruments(self) -> list[Instrument]:
+        return self._instruments
+
+    @property
+    def books(self) -> dict:
+        return self._books
+
+    @property
+    def signals(self) -> dict:
+        return self._signals
+
+    @property
+    def configs(self) -> dict:
+        return self._configs
+
+    @property
+    def risk(self) -> RiskManager:
+        return self._risk
+
+    @property
+    def realized_pnl(self) -> float:
+        return self._realized_pnl
+
+    def unrealized_pnl(self) -> float:
+        pnl = 0.0
+        for sym, entry in self._avg_entry.items():
+            pos = self._signals[sym].position
+            mid = self._books[sym].mid
+            if pos > 0 and mid > 0:
+                pnl += pos * (mid - entry)
+        return pnl
+
+    @property
+    def total_pnl(self) -> float:
+        return self._realized_pnl + self.unrealized_pnl()
 
     # ------------------------------------------------------------------ run
     async def run(self) -> None:
+        # GC tuning: after startup, everything long-lived (books, routers,
+        # loops) is frozen out of collection scans, and thresholds are
+        # raised so the young-gen sweep runs rarely — the steady-state loop
+        # allocates only small short-lived objects, so this trims periodic
+        # multi-ms GC pauses out of the tick-to-decision path.
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100_000, 50, 50)
+
         routers = {ins.router for ins in self._instruments}
         for r in routers:
             await r.connect()
         tasks = []
         for ins in self._instruments:
+            event = self._md_events[ins.symbol]
             tasks.append(asyncio.create_task(
-                ins.router.stream_market_data(ins.symbol, self._books[ins.symbol]),
+                ins.router.stream_market_data(
+                    ins.symbol, self._books[ins.symbol],
+                    on_update=event.set),
                 name=f"md:{ins.symbol}"))
             tasks.append(asyncio.create_task(
                 self._signal_loop(ins), name=f"sig:{ins.symbol}"))
@@ -88,19 +158,36 @@ class StrategyEngine:
         try:
             await asyncio.gather(*tasks)
         finally:
+            for t in tasks:
+                t.cancel()
             for r in routers:
                 await r.close()
 
     # -------------------------------------------------------------- control
     async def _control_loop(self) -> None:
-        """Slow loop: fold risk state + wall clock into the C++ regime gate.
+        """Slow loop: risk state + wall clock → C++ regime gate, plus the
+        two feeds the risk layer needs to actually do its job:
 
-        Runs at 1 Hz — regimes change on the scale of hours and the halt
-        flag on the scale of minutes; what matters is that the *enforcement*
-        of the regime is inside C++ on the signal path, so between control
-        ticks there is zero window where a stale Python flag can leak an
-        order."""
+          * mark-to-market equity → daily drawdown breaker
+          * 5-minute BTC/SOL mids → cross-correlation breakdown filter
+
+        Enforcement of the regime lives inside C++ on the signal path, so
+        between control ticks there is zero window where a stale Python
+        flag can leak an order."""
+        last_leader = 0.0
         while True:
+            now = time.time()
+            if now - last_leader >= LEADER_SAMPLE_S:
+                last_leader = now
+                for ins in self._instruments:
+                    base = ins.symbol.split("-")[0].upper()
+                    if base in ("BTC", "SOL"):
+                        mid = self._books[ins.symbol].mid
+                        if mid > 0:
+                            self._risk.on_leader_price(base, mid)
+
+            self._risk.on_equity(self._risk.starting_equity + self.total_pnl)
+
             halted = self._risk.halted
             for ins in self._instruments:
                 regime = self._night.resolve(ins.router.kind, halted)
@@ -111,20 +198,28 @@ class StrategyEngine:
     async def _signal_loop(self, ins: Instrument) -> None:
         book = self._books[ins.symbol]
         sig = self._signals[ins.symbol]
+        event = self._md_events[ins.symbol]
         Action = self._mc.Action
-        last_seq = -1
 
         while True:
-            await asyncio.sleep(SIGNAL_LOOP_S)
-            if book.seq == last_seq:
-                continue  # no new market data; don't re-decide on stale state
-            last_seq = book.seq
+            # Event-driven: the feed adapter sets the event the moment a
+            # frame has been applied to the C++ book, so we evaluate on
+            # fresh state immediately instead of polling. The timeout is a
+            # heartbeat so regime transitions still flush posture when the
+            # market goes quiet. No seq-dedup is needed: every action below
+            # is individually idempotent (position guards, deep-bid
+            # throttle, stop ratchet).
+            try:
+                await asyncio.wait_for(event.wait(), timeout=SIGNAL_FALLBACK_S)
+            except asyncio.TimeoutError:
+                pass
+            event.clear()
             s = sig.evaluate(book)
-
             if s.action == Action.NONE:
                 continue
 
             if s.action == Action.CANCEL_ALL_BIDS:
+                self._deep_bids.pop(ins.symbol, None)
                 await ins.router.cancel_all(ins.symbol)
 
             elif s.action == Action.ENTER_LONG:
@@ -134,6 +229,7 @@ class StrategyEngine:
                 notional = self._risk.position_notional(vol_proxy)
                 if notional <= 0:
                     continue
+                px = book.best_ask
                 qty = notional / s.mid
                 res = await ins.router.submit_order(OrderRequest(
                     symbol=ins.symbol, side=OrderSide.BUY,
@@ -141,40 +237,66 @@ class StrategyEngine:
                     qty=qty,
                     # Marketable limit at the ask, never a naked market
                     # order: caps slippage to the touch even on a CLOB.
-                    limit_price=book.best_ask,
+                    limit_price=px,
                     use_mev_protection=True))
                 if res.ok:
                     sig.position = sig.position + qty
-                    log.info("%s ENTER_LONG qty=%.6f z=%.2f obi=%.2f",
-                             ins.symbol, qty, s.z, s.obi)
+                    self._avg_entry[ins.symbol] = px
+                    log.info("%s ENTER_LONG qty=%.6f @ %.2f z=%.2f obi=%.2f",
+                             ins.symbol, qty, px, s.z, s.obi)
+                else:
+                    log.warning("%s entry rejected: %s", ins.symbol, res.error)
 
             elif s.action == Action.EXIT_LONG:
                 qty = sig.position
                 if qty <= 0:
                     continue
+                px = book.best_bid
                 res = await ins.router.submit_order(OrderRequest(
                     symbol=ins.symbol, side=OrderSide.SELL,
                     order_type=OrderType.LIMIT, qty=qty,
-                    limit_price=book.best_bid,
+                    limit_price=px,
                     use_mev_protection=True))
                 if res.ok:
                     sig.position = 0.0
                     self._trail_stops.pop(ins.symbol, None)
-                    log.info("%s EXIT_LONG qty=%.6f z=%.2f", ins.symbol, qty, s.z)
+                    entry = self._avg_entry.pop(ins.symbol, px)
+                    self._realized_pnl += qty * (px - entry)
+                    log.info("%s EXIT_LONG qty=%.6f @ %.2f pnl=%+.2f z=%.2f",
+                             ins.symbol, qty, px, qty * (px - entry), s.z)
+                else:
+                    log.warning("%s exit rejected: %s", ins.symbol, res.error)
 
             elif s.action == Action.PLACE_DEEP_BID:
-                # Night CEX posture: refresh the deep resting bid. Cancel-
-                # replace keeps exactly one working order per instrument.
-                await ins.router.cancel_all(ins.symbol)
+                # Night CEX posture: keep exactly one deep resting bid.
+                # Throttled cancel-replace — re-quote only when the quote is
+                # stale or fair value has moved materially; without this the
+                # loop would churn cancel/replace on every book tick, which
+                # is both venue-abusive and gives up queue priority for
+                # nothing.
+                if s.limit_price <= 0:
+                    continue
+                prev = self._deep_bids.get(ins.symbol)
+                if prev is not None:
+                    px_old, ts_old = prev
+                    moved = abs(s.limit_price - px_old)
+                    if (time.time() - ts_old < DEEP_BID_REFRESH_S
+                            and moved < DEEP_BID_REPRICE_SIGMA * book.sigma):
+                        continue
                 vol_proxy = book.sigma / book.vwap if book.vwap > 0 else 0.0
                 notional = self._risk.position_notional(vol_proxy)
-                if notional <= 0 or s.limit_price <= 0:
+                if notional <= 0:
                     continue
-                await ins.router.submit_order(OrderRequest(
+                await ins.router.cancel_all(ins.symbol)
+                res = await ins.router.submit_order(OrderRequest(
                     symbol=ins.symbol, side=OrderSide.BUY,
                     order_type=OrderType.LIMIT_POST_ONLY,
                     qty=notional / s.limit_price,
                     limit_price=s.limit_price))
+                if res.ok:
+                    self._deep_bids[ins.symbol] = (s.limit_price, time.time())
+                    log.info("%s deep bid %.2f (VWAP-%.1fσ)", ins.symbol,
+                             s.limit_price, self._configs[ins.symbol].night_k)
 
             elif s.action == Action.TRAIL_STOP:
                 # Ratchet: the stop only ever moves UP. C++ proposes
@@ -184,13 +306,16 @@ class StrategyEngine:
                 stop = max(prev, s.limit_price)
                 self._trail_stops[ins.symbol] = stop
                 if s.mid < stop and sig.position > 0:
+                    qty = sig.position
                     res = await ins.router.submit_order(OrderRequest(
                         symbol=ins.symbol, side=OrderSide.SELL,
-                        order_type=OrderType.MARKET, qty=sig.position,
+                        order_type=OrderType.MARKET, qty=qty,
                         use_mev_protection=True))
                     if res.ok:
                         sig.position = 0.0
                         self._trail_stops.pop(ins.symbol, None)
+                        entry = self._avg_entry.pop(ins.symbol, s.mid)
+                        self._realized_pnl += qty * (s.mid - entry)
                         log.info("%s TRAIL_STOP hit at %.8f", ins.symbol, s.mid)
 
     # ----------------------------------------------------------- checkpoint
