@@ -29,6 +29,16 @@ from meanrev.ui import TerminalDashboard
 
 SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD"]
 
+# ---- entry tuning ----------------------------------------------------------
+# ENTRY_Z: how many σ below VWAP price must fall to trigger a long. Lower =
+#   more trades, but each is weaker evidence of a real (mean-reverting)
+#   anomaly rather than ordinary noise. Default 2.5; 2.0 is a moderate
+#   loosening (~2-3x more entries); below ~1.8 you're mostly buying dips.
+# OBI_MIN: required bid-side order-book imbalance to confirm the entry (the
+#   anti-falling-knife check). Lower accepts weaker passive support.
+ENTRY_Z = 2.0
+OBI_MIN = 0.10
+
 logging.basicConfig(
     filename="meanrev.log", level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -44,6 +54,13 @@ async def main():
         risk=RiskManager(RiskConfig(max_daily_dd_pct=3.0),
                          starting_equity=100_000.0),
     )
+    # Apply the loosened trigger to every instrument. These mutate the same
+    # SignalConfig objects the C++ SignalGenerator reads, so the change
+    # takes effect on the next evaluation with no rebuild.
+    for cfg in engine.configs.values():
+        cfg.entry_z = ENTRY_Z
+        cfg.obi_min = OBI_MIN
+
     dashboard = TerminalDashboard(engine)
     await asyncio.gather(engine.run(), dashboard.run())
 

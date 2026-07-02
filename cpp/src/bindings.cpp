@@ -116,6 +116,14 @@ PYBIND11_MODULE(microcore, m) {
         .def_property("position",
                       &SignalGenerator::position, &SignalGenerator::set_position)
         .def_property_readonly("regime", &SignalGenerator::regime)
+        // `config` returns a reference to the generator's OWN config (not a
+        // copy), so `sig.config.entry_z = 2.0` writes through to what
+        // evaluate() reads. reference_internal ties the returned object's
+        // lifetime to the parent generator.
+        .def_property("config",
+                      py::cpp_function(&SignalGenerator::config_mut,
+                                       py::return_value_policy::reference_internal),
+                      py::cpp_function(&SignalGenerator::set_config))
         .def("evaluate", &SignalGenerator::evaluate, py::arg("book"));
 
     py::class_<Checkpointer>(m, "Checkpointer")

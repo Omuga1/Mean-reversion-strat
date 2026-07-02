@@ -50,6 +50,35 @@ def test_signal_regime_gate():
     assert sg.evaluate(ob).action == mc.Action.NONE
 
 
+def test_live_config_mutation_reaches_evaluator():
+    """sig.config is a reference to the generator's internal config, so
+    retuning it must change evaluate() on the next call (regression: it used
+    to be a disconnected copy, silently ignoring runtime retuning)."""
+    sg = mc.SignalGenerator(mc.SignalConfig())
+    ob = mc.OrderBook(0.01, 20)
+    for _ in range(100):
+        ob.on_trades_batch([99.0, 101.0], [1.0, 1.0])   # VWAP 100, σ 1
+    ob.apply_deltas_batch([0, 1], [97.99, 98.01], [10.0, 1.0])  # −2σ, OBI>0
+    assert sg.evaluate(ob).action == mc.Action.NONE       # 2.5σ default: no
+    sg.config.entry_z = 2.0
+    sg.config.obi_min = 0.10
+    assert sg.config.entry_z == 2.0                        # reads back
+    assert sg.evaluate(ob).action == mc.Action.ENTER_LONG  # now fires
+
+
+def test_engine_config_is_live(tmp_path):
+    """engine.configs entries must write through to the C++ evaluator."""
+    from meanrev.engine import Instrument, StrategyEngine
+
+    router = MockRouter()
+    risk = RiskManager(RiskConfig(), starting_equity=100_000)
+    engine = StrategyEngine([Instrument("X-USD", 0.01, router)],
+                            ckpt_dir=str(tmp_path), risk=risk)
+    engine.configs["X-USD"].entry_z = 1.75
+    # The generator itself must now report the loosened threshold.
+    assert engine.signals["X-USD"].config.entry_z == 1.75
+
+
 def test_cpp_checkpoint_roundtrip(tmp_path):
     path = str(tmp_path / "book.ckpt")
     ob = mc.OrderBook(0.01, 20)

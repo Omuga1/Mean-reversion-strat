@@ -86,7 +86,11 @@ class StrategyEngine:
                          ins.symbol, book.seq, sig.position)
             self._books[ins.symbol] = book
             self._signals[ins.symbol] = sig
-            self._configs[ins.symbol] = cfg
+            # Store the generator's LIVE config (a reference to its internal
+            # cfg_), not the throwaway `cfg` we constructed it with — that
+            # one is a disconnected copy. Retuning engine.configs[...] now
+            # writes straight through to what evaluate() reads.
+            self._configs[ins.symbol] = sig.config
             self._ckpts[ins.symbol] = ckpt
             self._md_events[ins.symbol] = asyncio.Event()
 

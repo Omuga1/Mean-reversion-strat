@@ -156,7 +156,14 @@ public:
         }
     }
 
+    // Live config access. evaluate() reads cfg_ directly, so mutating the
+    // returned reference (or replacing it via set_config) changes strategy
+    // behavior on the very next evaluation — this is what lets the Python
+    // layer retune entry_z / obi_min at runtime with no rebuild, and keeps
+    // the dashboard's view identical to what the evaluator actually uses.
     const SignalConfig& config() const noexcept { return cfg_; }
+    SignalConfig&       config_mut() noexcept { return cfg_; }
+    void set_config(const SignalConfig& c) noexcept { cfg_ = c; }
 
 private:
     SignalConfig cfg_;
